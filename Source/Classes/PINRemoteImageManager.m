@@ -32,11 +32,12 @@
 #import "PINImage+DecodedImage.h"
 #import "PINImage+ScaledImage.h"
 
-#if USE_PINCACHE
 #import "PINCache+PINRemoteImageCaching.h"
-#else
-#import "PINRemoteImageBasicCache.h"
-#endif
+//#if USE_PINCACHE
+//
+//#else
+//#import "PINRemoteImageBasicCache.h"
+//#endif
 
 
 #define PINRemoteImageManagerDefaultTimeout            30.0
@@ -98,6 +99,7 @@ typedef void (^PINRemoteImageManagerDataCompletion)(NSData *data, NSURLResponse 
 }
 
 @property (nonatomic, strong) id<PINRemoteImageCaching> cache;
+@property (nonatomic, readonly) id<PINRemoteImageTTLCaching> _Nullable ttlCache;
 @property (nonatomic, strong) PINURLSessionManager *sessionManager;
 @property (nonatomic, strong) NSMutableDictionary <NSString *, __kindof PINRemoteImageTask *> *tasks;
 @property (nonatomic, strong) NSHashTable <NSUUID *> *canceledTasks;
@@ -116,7 +118,7 @@ typedef void (^PINRemoteImageManagerDataCompletion)(NSData *data, NSURLResponse 
 @property (nonatomic, copy) id<PINRequestRetryStrategy> (^retryStrategyCreationBlock)(void);
 @property (nonatomic, copy) PINRemoteImageManagerRequestConfigurationHandler requestConfigurationHandler;
 @property (nonatomic, strong) NSMutableDictionary <NSString *, NSString *> *httpHeaderFields;
-@property (nonatomic, readonly) BOOL isTtlCache;
+@property (nonatomic, readonly) BOOL cacheTTLIsEnabled;
 #if DEBUG
 @property (nonatomic, assign) NSUInteger totalDownloads;
 #endif
@@ -189,9 +191,16 @@ static dispatch_once_t sharedFormatterToken;
         if (imageCache) {
             self.cache = imageCache;
         } else {
-            self.cache = [self defaultImageCache];
+            self.cache = [PINRemoteImageManager defaultImageCache];
         }
-        _isTtlCache = [self.cache respondsToSelector:@selector(setObjectOnDisk:forKey:withAgeLimit:)];
+        Protocol *p1 = @protocol(PINRemoteImageCaching);
+        Protocol * p2 = @protocol(PINRemoteImageTTLCaching);
+
+        BOOL t1 = [self.cache conformsToProtocol:p2];
+        BOOL t2 = [self.cache conformsToProtocol:p1];
+        BOOL t3 = ((id<PINRemoteImageTTLCaching>) self.cache).diskCacheIsTTLCache;
+
+        _cacheTTLIsEnabled = ( [[self.cache class] conformsToProtocol:@protocol(PINRemoteImageTTLCaching)] && ((id<PINRemoteImageTTLCaching>) self.cache).diskCacheIsTTLCache );
 
         _sessionConfiguration = [configuration copy];
         if (!_sessionConfiguration) {
@@ -237,7 +246,15 @@ static dispatch_once_t sharedFormatterToken;
     return [[PINRequestExponentialRetryStrategy alloc] initWithRetryMaxCount:3 delayBase:4];
 }
 
-- (id<PINRemoteImageCaching>)defaultImageCache
++ (id<PINRemoteImageCaching>)defaultImageCache {
+    return [PINRemoteImageManager defaultImageCacheEnablingTtl:NO];
+}
+
++ (id<PINRemoteImageCaching>)defaultImageTtlCache {
+    return [PINRemoteImageManager defaultImageCacheEnablingTtl:YES];
+}
+
++ (id<PINRemoteImageCaching>)defaultImageCacheEnablingTtl:(BOOL)enableTtl
 {
 #if USE_PINCACHE
     NSString * const kPINRemoteImageDiskCacheName = @"PINRemoteImageManagerCache";
@@ -259,21 +276,28 @@ static dispatch_once_t sharedFormatterToken;
         [pinDefaults setInteger:kPINRemoteImageDiskCacheVersion forKey:kPINRemoteImageDiskCacheVersionKey];
     }
 
-    return [[PINCache alloc] initWithName:kPINRemoteImageDiskCacheName rootPath:cacheURLRoot serializer:^NSData * (id <NSCoding>  _Nonnull object, NSString * _Nonnull key) {
+    return [[PINCache alloc] initWithName:kPINRemoteImageDiskCacheName rootPath:cacheURLRoot serializer:^NSData * _Nonnull(id<NSCoding>  _Nonnull object, NSString * _Nonnull key) {
         id <NSCoding, NSObject> obj = (id <NSCoding, NSObject>)object;
         if ([key hasPrefix:PINRemoteImageCacheKeyResumePrefix]) {
             return [NSKeyedArchiver archivedDataWithRootObject:obj];
         }
         return (NSData *)object;
-    } deserializer:^id <NSCoding> _Nonnull(NSData * _Nonnull data, NSString * _Nonnull key) {
+    } deserializer:^id<NSCoding> _Nonnull(NSData * _Nonnull data, NSString * _Nonnull key) {
         if ([key hasPrefix:PINRemoteImageCacheKeyResumePrefix]) {
             return [NSKeyedUnarchiver unarchiveObjectWithData:data];
         }
         return data;
-    } keyEncoder:nil keyDecoder:nil ttlCache:YES];
+    } keyEncoder:nil keyDecoder:nil ttlCache:enableTtl];
 #else
     return [[PINRemoteImageBasicCache alloc] init];
 #endif
+}
+
+- (id<PINRemoteImageTTLCaching> _Nullable)TtlCache {
+    if (self.cacheTTLIsEnabled) {
+        return (id<PINRemoteImageTTLCaching>) self.cache;
+    }
+    return nil;
 }
 
 - (void)lockOnMainThread
@@ -808,7 +832,7 @@ static dispatch_once_t sharedFormatterToken;
             __block NSNumber *maxAge = nil;
             if (remoteImageError == nil) {
                 BOOL ignoreHeaders = (options & PINRemoteImageManagerDownloadOptionsIgnoreCacheControlHeaders) != 0;
-                if (_isTtlCache && !ignoreHeaders) {
+                if (self.cacheTTLIsEnabled && !ignoreHeaders) {
                     // examine Cache-Control headers (https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control)
                     if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
                         NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *) response;
@@ -1432,15 +1456,21 @@ static dispatch_once_t sharedFormatterToken;
     }
     
     if (diskData) {
-        // maxAge of 0 means that images should not be stored at all.
+        id<PINRemoteImageTTLCaching> ttlCache = self.ttlCache;
+
+        // maxAge set to 0 means that images should not be stored at all.
+        BOOL doNotCache = (maxAge != nil && [maxAge integerValue] == 0);
+
         // There is no HTTP header that can be sent to indicate "infinite". However not setting a value at all, which in
         // our case is represented by maxAge == nil, effectively means that.
-        if (!(maxAge && [maxAge integerValue] == 0)) {
-            if (maxAge && _isTtlCache) {
-                [self.cache setObjectOnDisk:diskData forKey:key withAgeLimit:[maxAge integerValue]];
-            } else {
-                // unset (nil) maxAge, or a cache that is not _isTtlCache behave as before (will use cache global ageLimit)
+        BOOL cacheIndefinitely = (maxAge == nil);
+
+        if (!doNotCache) {
+            if (!ttlCache || cacheIndefinitely) {
+                // with an unset (nil) maxAge, or a cache that is not _isTtlCache, behave as before (will use cache global behavior)
                 [self.cache setObjectOnDisk:diskData forKey:key];
+            } else {
+                [self.TtlCache setObjectOnDisk:diskData forKey:key withAgeLimit:[maxAge integerValue]];
             }
         }
     }

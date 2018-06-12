@@ -11,12 +11,12 @@
 #import "PINRemoteImageCaching.h"
 #import "PINRemoteImageManager.h"
 
-@interface PINCache (PINRemoteImageCaching) <PINRemoteImageCaching>
+@interface PINCache (PINRemoteImageCaching) <PINRemoteImageTTLCaching>
 
 @end
 
 @interface PINRemoteImageManager (PINCache)
 
-@property (nonatomic, nullable, readonly) PINCache <PINRemoteImageCaching> *pinCache;
+@property (nonatomic, nullable, readonly) PINCache <PINRemoteImageTTLCaching> *pinCache;
 
 @end

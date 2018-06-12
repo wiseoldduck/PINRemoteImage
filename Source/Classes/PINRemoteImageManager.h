@@ -21,6 +21,7 @@
 
 @protocol PINRemoteImageManagerAlternateRepresentationProvider;
 @protocol PINRemoteImageCaching;
+@protocol PINRemoteImageTTLCaching;
 
 @class PINRemoteImageManagerResult;
 
@@ -209,7 +210,13 @@ typedef void(^PINRemoteImageManagerMetrics)(NSURL  * __nonnull url, NSURLSession
   @warning This method is meant only for override. It will be called *once* by an instance of PINRemoteImageManager. The default implementation creates a new cache on every call. If you're looking to access the cache being used by an instance of PINRemoteImageManager, @c cache.
  @return An instance of a object, implementing PINRemoteImageCaching protocol.
  */
-- (nonnull id<PINRemoteImageCaching>)defaultImageCache;
++ (nonnull id<PINRemoteImageCaching>)defaultImageCache;
+
+/**
+ * If you want a Ttl (maxAge) image cache, you can pass the result of this method explicitly into the initWithSessionConfiguration:alternativeRepresentationProvider:imageCache: initializer.
+ * @return An instance of a object, implementing PINRemoteImageTTLCaching protocol.
+ */
++ (nonnull id<PINRemoteImageTTLCaching>)defaultImageTtlCache;
 
 /**
  * Sets a custom header to be included in every request. Headers set from this method will override any header from NSURLSessionConfiguration.
